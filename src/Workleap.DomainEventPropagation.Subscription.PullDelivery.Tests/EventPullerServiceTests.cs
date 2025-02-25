@@ -31,7 +31,7 @@ public class EventPullerServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task GivenFailingClient_WhenErrorOccured_ThenKeepsPollingAndDoesNotInterfereWithOtherClients()
+    public async Task GivenClientFailingOnReceiving_WhenErrorOccured_ThenBubbleUpException()
     {
         // Given
         var failingClient = this.GivenClient("client1");
@@ -41,11 +41,61 @@ public class EventPullerServiceTests : IDisposable
         var events = this.GivenEventsForClient(functionalClient, GenerateEvent());
 
         // When
-        await this.WhenRunningPullerService();
+        await Assert.ThrowsAsync<LocalTestException>(this.WhenRunningPullerService);
 
         // Then
         this.ThenClientReceivedEvents(failingClient);
         this.ThenClientHandledEvents(functionalClient, events);
+    }
+
+    [Fact]
+    public async Task GivenClientFailingOnAcknowledgeCallback_WhenErrorOccured_ThenBubbleUpException()
+    {
+        // Given
+        var client = this.GivenClient();
+
+        this.GivenClientFailsAcknowledgingEvents(client);
+        this.GivenEventsForClient(client, GenerateEvent());
+
+        // When
+        await Assert.ThrowsAsync<LocalTestException>(this.WhenRunningPullerService);
+
+        // Then
+        this.ThenClientReceivedEvents(client);
+    }
+
+    [Fact]
+    public async Task GivenClientFailingOnReleaseCallback_WhenErrorOccured_ThenBubbleUpException()
+    {
+        // Given
+        var client = this.GivenClient();
+
+        this.GivenClientFailsReleasingEvents(client);
+        this.GivenEventsForClient(client, GenerateEvent());
+        this.GivenClientFailsHandlingEvents(client);
+
+        // When
+        await Assert.ThrowsAsync<LocalTestException>(this.WhenRunningPullerService);
+
+        // Then
+        this.ThenClientReceivedEvents(client);
+    }
+
+    [Fact]
+    public async Task GivenClientFailingOnRejectCallback_WhenErrorOccured_ThenBubbleUpException()
+    {
+        // Given
+        var client = this.GivenClient(options: new EventPropagationSubscriptionOptions { MaxRetries = 2 });
+
+        this.GivenClientFailsRejectingEvents(client);
+        this.GivenEventsForClient(client, GenerateEvent(deliveryCount: 4));
+        this.GivenClientFailsHandlingEvents(client);
+
+        // When
+        await Assert.ThrowsAsync<LocalTestException>(this.WhenRunningPullerService);
+
+        // Then
+        this.ThenClientReceivedEvents(client);
     }
 
     [Fact]
@@ -206,7 +256,34 @@ public class EventPullerServiceTests : IDisposable
 
     private void GivenClientFailsReceivingEvents(EventPullerClient client)
     {
-        A.CallTo(() => client.Client.ReceiveCloudEventsAsync(client.Options.TopicName, client.Options.SubscriptionName, A<int>._, A<CancellationToken>._)).Throws<Exception>();
+        A.CallTo(() => client.Client.ReceiveCloudEventsAsync(client.Options.TopicName, client.Options.SubscriptionName, A<int>._, A<CancellationToken>._)).Throws<LocalTestException>();
+
+        // Disable completion on events received to make sure we wait around and see the exception happen
+        this._eventCounter += 1;
+    }
+
+    private void GivenClientFailsAcknowledgingEvents(EventPullerClient client)
+    {
+        A.CallTo(() => client.Client.AcknowledgeCloudEventsAsync(client.Options.TopicName, client.Options.SubscriptionName, A<IEnumerable<string>>._, A<CancellationToken>._)).Throws<LocalTestException>();
+
+        // Disable completion on events received to make sure we wait around and see the exception happen
+        this._eventCounter += 1;
+    }
+
+    private void GivenClientFailsReleasingEvents(EventPullerClient client)
+    {
+        A.CallTo(() => client.Client.ReleaseCloudEventsAsync(client.Options.TopicName, client.Options.SubscriptionName, A<IEnumerable<string>>._, A<TimeSpan>._, A<CancellationToken>._)).Throws<LocalTestException>();
+
+        // Disable completion on events received to make sure we wait around and see the exception happen
+        this._eventCounter += 1;
+    }
+
+    private void GivenClientFailsRejectingEvents(EventPullerClient client)
+    {
+        A.CallTo(() => client.Client.RejectCloudEventsAsync(client.Options.TopicName, client.Options.SubscriptionName, A<IEnumerable<string>>._, A<CancellationToken>._)).Throws<LocalTestException>();
+
+        // Disable completion on events received to make sure we wait around and see the exception happen
+        this._eventCounter += 1;
     }
 
     private EventBundle[] GivenEventsForClient(EventPullerClient client, params EventBundle[] events)
@@ -238,9 +315,27 @@ public class EventPullerServiceTests : IDisposable
         this._pullerService = new EventPullerService(this._scopeFactory, this._clients.Select(x => new EventGridClientDescriptor(x.Name)), this._eventGridClientWrapperFactory, this._optionsMonitor, new NullLogger<EventPullerService>());
 
         // We need this to start on the thread pool otherwise it will just block the test
-        Task.Run(() => this._pullerService.StartAsync(CancellationToken.None)).Forget();
+        Task.Run(this.RunPullerService).Forget();
+
         await this._eventCompletionSource.Task;
         await this._pullerService.StopAsync(CancellationToken.None);
+    }
+
+    private async Task RunPullerService()
+    {
+        try
+        {
+            // This only starts the background service, the actual task is not awaited
+            await this._pullerService!.StartAsync(CancellationToken.None);
+
+            // This is the actual task from the background service, if it crashes it will be rethrown here
+            await this._pullerService!.ExecuteTask!.ConfigureAwait(false);
+        }
+        catch (Exception e)
+        {
+            this._eventCompletionSource.SetException(e);
+            throw;
+        }
     }
 
     private void ThenClientReceivedEvents(EventPullerClient client)
@@ -320,4 +415,6 @@ public class EventPullerServiceTests : IDisposable
     internal sealed record EventPullerClient(string Name, IEventGridClientAdapter Client, ICloudEventHandler EventHandler, EventPropagationSubscriptionOptions Options, EventHandlingResult EventHandlingResult);
 
     internal sealed record EventHandlingResult(List<string> AcknowledgedEvents, List<(string LockToken, TimeSpan ReleaseDelay)> ReleasedEvents, List<string> RejectedEvents);
+
+    internal sealed class LocalTestException : Exception;
 }

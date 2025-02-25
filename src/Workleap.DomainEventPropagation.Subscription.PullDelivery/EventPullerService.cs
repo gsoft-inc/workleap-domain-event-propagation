@@ -35,9 +35,33 @@ internal sealed class EventPullerService : BackgroundService
             .ToList();
     }
 
-    protected override Task ExecuteAsync(CancellationToken stoppingToken)
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        return Task.WhenAll(this._eventGridSubscriptionPullers.Select(puller => Task.Run(() => puller.StartReceivingEventsAsync(stoppingToken), stoppingToken)));
+        using var taskCancellationSource = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+        var subscriptionTasks = this._eventGridSubscriptionPullers
+            .Select(puller => Task.Run(() => puller.StartReceivingEventsAsync(taskCancellationSource.Token), taskCancellationSource.Token))
+            .ToList();
+
+        while (subscriptionTasks.Any())
+        {
+            var task = await Task.WhenAny(subscriptionTasks).ConfigureAwait(false);
+
+            subscriptionTasks.Remove(task);
+
+            try
+            {
+                // This will throw the exception if there is one, otherwise we'll continue until all tasks are done
+                await task.ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                // To prevent unobserved exceptions, we cancel the tasks and wait for them to complete before throwing
+                await taskCancellationSource.CancelAsync().ConfigureAwait(false);
+                await Task.WhenAll(subscriptionTasks).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+
+                throw;
+            }
+        }
     }
 
     private class EventGridSubscriptionEventPuller
@@ -82,14 +106,28 @@ internal sealed class EventPullerService : BackgroundService
             }
         }
 
-        public Task StartReceivingEventsAsync(CancellationToken cancellationToken)
+        public async Task StartReceivingEventsAsync(CancellationToken cancellationToken)
         {
+            // Use a local cancellation token source to allow stopping the events reception/processing if a callback task crashes
+            using var cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
             // Start the tasks that will process events and handle the completion callback
-            return Task.WhenAll(
-                this.ProcessEvents(cancellationToken),
-                this.AcknowledgeEvents(cancellationToken),
-                this.ReleaseEvents(cancellationToken),
-                this.RejectEvents(cancellationToken));
+            Task[] eventProcessingTasks =
+            [
+                this.ProcessEvents(cancellationTokenSource.Token),
+                    this.AcknowledgeEvents(cancellationToken),
+                    this.ReleaseEvents(cancellationToken),
+                    this.RejectEvents(cancellationToken)
+            ];
+
+            await Task.WhenAny(eventProcessingTasks).ConfigureAwait(false);
+
+            // If any task completed, we want to stop receiving/processing events, flush the channels and then throw (if needed)
+            await cancellationTokenSource.CancelAsync().ConfigureAwait(false);
+            this.CompleteEventChannels();
+
+            // Since the event processing task was cancelled and the callback channels completed, all the tasks should complete shortly
+            await Task.WhenAll(eventProcessingTasks).ConfigureAwait(false);
         }
 
         private Task ProcessEvents(CancellationToken cancellationToken)
@@ -168,7 +206,7 @@ internal sealed class EventPullerService : BackgroundService
 
         private async Task AcknowledgeEvents(CancellationToken cancellationToken)
         {
-            while (!cancellationToken.IsCancellationRequested)
+            while (!cancellationToken.IsCancellationRequested && !this._acknowledgeEventChannel.Reader.Completion.IsCompleted)
             {
                 await this._acknowledgeEventChannel.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false);
 
@@ -179,7 +217,7 @@ internal sealed class EventPullerService : BackgroundService
 
         private async Task ReleaseEvents(CancellationToken cancellationToken)
         {
-            while (!cancellationToken.IsCancellationRequested)
+            while (!cancellationToken.IsCancellationRequested && !this._releaseEventChannel.Reader.Completion.IsCompleted)
             {
                 await this._releaseEventChannel.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false);
 
@@ -196,13 +234,20 @@ internal sealed class EventPullerService : BackgroundService
 
         private async Task RejectEvents(CancellationToken cancellationToken)
         {
-            while (!cancellationToken.IsCancellationRequested)
+            while (!cancellationToken.IsCancellationRequested && !this._rejectEventChannel.Reader.Completion.IsCompleted)
             {
                 await this._rejectEventChannel.Reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false);
 
                 var lockTokens = ReadCurrentContent(this._rejectEventChannel).Select(x => x.LockToken);
                 await this._eventGridTopicSubscription.Client.RejectCloudEventsAsync(this._eventGridTopicSubscription.TopicName, this._eventGridTopicSubscription.SubscriptionName, lockTokens, cancellationToken).ConfigureAwait(false);
             }
+        }
+
+        private void CompleteEventChannels()
+        {
+            this._acknowledgeEventChannel.Writer.TryComplete();
+            this._releaseEventChannel.Writer.TryComplete();
+            this._rejectEventChannel.Writer.TryComplete();
         }
 
         private void SignalHandlerStarting()
